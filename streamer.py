@@ -1,51 +1,83 @@
+import atexit
 import os
+import signal
+import subprocess
+import sys
 import time
 
 import docker
-import signal
-import atexit
-import subprocess
+import requests
 
 
 class MediaMTXContainer:
 	def __init__(self):
 		self.client = docker.from_env()
 		self.container = None
+		self.ip = None
 
 	def start_container(self):
 		self.container = self.client.containers.run(
 			"bluenviron/mediamtx",
 			detach=True,
-			network_mode="host",
+			auto_remove=True,  # no stale containers after stop
 			environment={"MTX_API": "yes"},
+			# Published ports are for remote receivers (DNAT keeps UDP source ports).
+			# Local publishing bypasses them by talking to the container IP directly.
+			ports={
+				"8554/tcp": 8554,
+				"9997/tcp": 9997,
+				"8000/udp": 8000,
+				"8001/udp": 8001,
+			},
+			volumes={
+				os.path.abspath("mediamtx.yml"):
+					{"bind": "/mediamtx.yml", "mode": "ro"}
+			},
 		)
-		atexit.register(self.handle_exit)
-		signal.signal(signal.SIGINT, self.handle_exit)
-		signal.signal(signal.SIGTERM, self.handle_exit)
-		print("Container started.")
+		self.container.reload()
+		self.ip = self._get_ip()
+		self._wait_until_ready()
+		print(f"Container started. MediaMTX reachable locally at {self.ip}")
+
+	def _get_ip(self):
+		settings = self.container.attrs["NetworkSettings"]
+		ip = settings.get("IPAddress")
+		if ip:
+			return ip
+		# Custom networks / compose: IP lives under Networks[<name>]
+		for net in settings.get("Networks", {}).values():
+			if net.get("IPAddress"):
+				return net["IPAddress"]
+		raise RuntimeError("Could not determine the container's IP address.")
+
+	def _wait_until_ready(self, timeout=15):
+		deadline = time.time() + timeout
+		while time.time() < deadline:
+			try:
+				requests.get(f"http://{self.ip}:9997/v3/paths/list", timeout=1)
+				return
+			except requests.RequestException:
+				time.sleep(0.5)
+		raise RuntimeError("MediaMTX did not become ready in time.")
 
 	def stop_container(self):
-		if self.container:
+		if not self.container:
+			return
+		try:
 			self.container.stop()
 			print("Container stopped.")
-		else:
-			print("No container is running.")
-
-	def handle_exit(self, signum=None, frame=None):
-		print("Signal received. Stopping container...")
-		self.stop_container()
-		exit(0)
+		except docker.errors.NotFound:
+			pass  # already stopped and auto-removed
+		self.container = None
 
 
-def launch_camera(video_id):
-	# gst-launch-1.0 v4l2src device=/dev/video0 ! \
-	# image/jpeg, width=1280, height=720, framerate=30/1 ! \
-	# jpegdec ! videoconvert ! \
-	# x264enc tune=zerolatency bitrate=1500 speed-preset=ultrafast key-int-max=30 ! \
-	# h264parse ! \
-	# rtspclientsink location=rtsp://127.0.0.1:8554/test
+camera_processes = []
 
-	subprocess.Popen(
+
+def launch_camera(video_id, host):
+	# Publish to the container's bridge IP (NOT 127.0.0.1) so traffic bypasses
+	# docker-proxy, which rewrites the UDP source port and breaks MediaMTX's check.
+	proc = subprocess.Popen(
 		[
 			"gst-launch-1.0",
 			"v4l2src",
@@ -64,22 +96,48 @@ def launch_camera(video_id):
 			"key-int-max=30",
 			"!",
 			"h264parse",
+			"config-interval=-1",  # resend SPS/PPS so late joiners can decode
 			"!",
 			"rtspclientsink",
-			f"location=rtsp://127.0.0.1:8554/stream{video_id}",
+			"protocols=udp",
+			f"location=rtsp://{host}:8554/stream{video_id}",
 		]
 	)
+	camera_processes.append(proc)
 	print(f"Camera stream launched for video ID {video_id}.")
+
+
+def stop_cameras():
+	for proc in camera_processes:
+		if proc.poll() is None:
+			proc.terminate()
+	for proc in camera_processes:
+		try:
+			proc.wait(timeout=5)
+		except subprocess.TimeoutExpired:
+			proc.kill()
+	camera_processes.clear()
 
 
 def main():
 	media_mtx = MediaMTXContainer()
-	media_mtx.start_container()
-	time.sleep(5)  # Wait for the container to be fully up and running
 
-	launch_camera(video_id=0)
+	def cleanup():
+		stop_cameras()
+		media_mtx.stop_container()
+
+	atexit.register(cleanup)
+	# Convert signals into a normal exit so atexit runs cleanup exactly once.
+	signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+	signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+	media_mtx.start_container()
+	launch_camera(video_id=0, host=media_mtx.ip)
 
 	while True:
+		if any(p.poll() is not None for p in camera_processes):
+			print("A camera pipeline exited. Shutting down.")
+			sys.exit(1)
 		time.sleep(1)
 
 

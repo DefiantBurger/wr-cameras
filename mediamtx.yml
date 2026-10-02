@@ -1,0 +1,62 @@
+###############################################
+# Global settings
+###############################################
+logLevel: info
+logDestinations: [stdout]
+
+###############################################
+# Authentication
+###############################################
+authMethod: internal
+authInternalUsers:
+  # 1. Local publisher: Only connections originating from the local computer
+  # (localhost / loopback and Docker bridge subnet) are allowed to publish.
+  - user: any
+    ips:
+      - 127.0.0.1
+      - "::1"
+      - 172.16.0.0/12
+    permissions:
+      - action: publish
+      - action: api
+      - action: metrics
+      - action: pprof
+
+  # 2. Remote & Local readers: Any computer can read/view streams and query
+  # the API (required by receiver.py to discover active streams via /v3/paths/list).
+  - user: any
+    ips: []
+    permissions:
+      - action: read
+      - action: playback
+      - action: api
+
+###############################################
+# Control API (used for stream discovery)
+###############################################
+api: yes
+apiAddress: :9997
+
+###############################################
+# RTSP Server (video streaming)
+###############################################
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [udp, multicast, tcp]
+rtpAddress: :8000
+rtcpAddress: :8001
+
+###############################################
+# Disable unused protocols to reduce resource overhead
+###############################################
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+moq: no
+
+###############################################
+# Paths configuration
+###############################################
+paths:
+  all_others:
